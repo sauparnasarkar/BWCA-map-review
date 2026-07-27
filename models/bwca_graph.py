@@ -49,6 +49,8 @@ class bwca_graph:
 
                 district=row["District"],
 
+                distance_to_lake=row["distance_to_lake"],
+
                 geometry=row.geometry
 
             )

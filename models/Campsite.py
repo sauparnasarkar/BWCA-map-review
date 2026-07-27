@@ -16,6 +16,8 @@ class Campsite:
 
     district: str
 
+    distance_to_lake: float
+
     geometry: object
 
     lake = None

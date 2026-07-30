@@ -2,6 +2,7 @@
 import geopandas as gpd
 from models.Campsite import Campsite
 from models.Lake import Lake
+from models.Portage import Portage
 
 class bwca_graph:
 
@@ -10,6 +11,8 @@ class bwca_graph:
         self.lakes = {}
 
         self.campsites = {}
+
+        self.portages = []
 
 
 
@@ -68,6 +71,39 @@ class bwca_graph:
                 campsite.lake = lake
 
                 lake.campsites.append(campsite)
+
+    def load_portages(self, filename):
+        portage_df = gpd.read_parquet(filename)
+
+        for _, row in portage_df.iterrows():
+
+            lake_a = self.lakes.get(row["fw_id_a"])
+            lake_b = self.lakes.get(row["fw_id_b"])
+
+            if lake_a is None or lake_b is None:
+                continue
+
+            portage = Portage(
+                Lake_a=lake_a,
+                Lake_b=lake_b,
+                length_rods=row["rods"],
+                geometry=row.geometry,
+                lake_match_uncertain=row["lake_match_uncertain"],
+                portage_number=row["portage_number"],
+                usfs_id=row["usfs_id"],
+                waterbody=row["waterbody"],
+                dist_lake_a=row["dist_lake_a"],
+                dist_lake_b=row["dist_lake_b"]
+            )
+
+            self.portages.append(portage)
+
+    def connect_portages(self):
+
+        for portage in self.portages:
+
+            portage.Lake_a.connections.append(portage)
+            portage.Lake_b.connections.append(portage)
 
     def find_lake(self, fw_id):
 

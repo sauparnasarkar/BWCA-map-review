@@ -88,6 +88,13 @@ print(len(campsites))
 # [1947 rows x 6 columns]
 # 4514
 # 2021
+# DNR hydrography CRS comes through as a "promoted to 3D" PROJJSON, which QGIS
+# reads as "no projection specification" and silently mis-plots. Force a clean
+# EPSG tag before writing so downstream tools (QGIS, portageCreator.py) get a
+# sane CRS.
+bwca_lakes = bwca_lakes.to_crs("EPSG:26915")  # NAD83 / UTM zone 15N
+campsites = campsites.to_crs("EPSG:26915")
+
 bwca_lakes.to_parquet(
     "../Data/Processed/bwca_lakes.parquet"
 )

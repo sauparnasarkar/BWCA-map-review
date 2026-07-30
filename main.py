@@ -1,3 +1,6 @@
+import duckdb
+import geopandas as gpd
+
 from models.bwca_graph import bwca_graph
 # print(bwca_graph)
 # print(type(bwca_graph))
@@ -30,3 +33,28 @@ for campsite in knife.campsites:
         f'"{campsite.district}",'
         f'{campsite.distance_to_lake}'
     )
+
+portages = gpd.read_parquet("Data/processed/bwca_portages.parquet")
+knife_portages = portages[
+    (portages["fw_id_a"] == knife.fw_id) | (portages["fw_id_b"] == knife.fw_id)
+]
+
+print(len(knife_portages))
+
+for portage in knife_portages.itertuples():
+    print(
+        f'{portage.portage_number},'
+        f'"{portage.waterbody}",'
+        f'{portage.rods},'
+        f'{portage.fw_id_a},'
+        f'{portage.fw_id_b},'
+        f'{portage.lake_match_uncertain}'
+    )
+
+duckdb.sql(f"""
+    SELECT portage_number, waterbody, rods, fw_id_a, fw_id_b, lake_match_uncertain,
+        start_lat, start_lon, end_lat, end_lon, dist_lake_a, dist_lake_b
+    FROM 'Data/processed/bwca_portages.parquet'
+    WHERE (fw_id_a = {knife.fw_id} OR fw_id_b = {knife.fw_id})
+    AND lake_match_uncertain = false
+""").write_csv("basswood_portages.csv")

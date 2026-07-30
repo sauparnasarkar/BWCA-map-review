@@ -3,3 +3,4 @@ pyogrio
 folium
 matplotlib
 pyarrow
+duckdb

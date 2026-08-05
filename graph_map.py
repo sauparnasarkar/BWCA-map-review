@@ -41,10 +41,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>
 """
 
-JS_TEMPLATE = """    const lakes = __LAKES_GEOJSON__;
-    const campsites = __CAMPSITES_GEOJSON__;
-    const portages = __PORTAGES_GEOJSON__;
+JS_TEMPLATE = """    const LAKES_URL = "__LAKES_URL__";
+    const CAMPSITES_URL = "__CAMPSITES_URL__";
+    const PORTAGES_URL = "__PORTAGES_URL__";
 
+    function init(lakes, campsites, portages) {
     const map = L.map("map");
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         attribution: "&copy; OpenStreetMap contributors"
@@ -459,6 +460,18 @@ JS_TEMPLATE = """    const lakes = __LAKES_GEOJSON__;
     map.on("click", (e) => handleRouteClick(e.latlng));
     portagesLayer.on("click", (e) => handleRouteClick(e.latlng));
     campsitesLayer.on("click", (e) => handleRouteClick(e.latlng));
+    }
+
+    Promise.all([
+        fetch(LAKES_URL).then((r) => r.json()),
+        fetch(CAMPSITES_URL).then((r) => r.json()),
+        fetch(PORTAGES_URL).then((r) => r.json()),
+    ])
+        .then(([lakes, campsites, portages]) => init(lakes, campsites, portages))
+        .catch((err) => {
+            console.error("Failed to load map data:", err);
+            document.getElementById("map").textContent = "Failed to load map data - see console for details.";
+        });
 """
 
 
@@ -531,21 +544,35 @@ def portages_geojson(graph):
 
 def render_map(graph, out_path="maps/bwca_graph_map.html"):
     out_path = Path(out_path)
-    js_filename = out_path.stem + ".js"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    js_filename = out_path.stem + ".js"
+    lakes_filename = out_path.stem + "_lakes.json"
+    campsites_filename = out_path.stem + "_campsites.json"
+    portages_filename = out_path.stem + "_portages.json"
+
+    html = HTML_TEMPLATE.replace("__JS_FILENAME__", js_filename)
     js = (
         JS_TEMPLATE
-        .replace("__LAKES_GEOJSON__", json.dumps(lakes_geojson(graph)))
-        .replace("__CAMPSITES_GEOJSON__", json.dumps(campsites_geojson(graph)))
-        .replace("__PORTAGES_GEOJSON__", json.dumps(portages_geojson(graph)))
+        .replace("__LAKES_URL__", lakes_filename)
+        .replace("__CAMPSITES_URL__", campsites_filename)
+        .replace("__PORTAGES_URL__", portages_filename)
     )
-    html = HTML_TEMPLATE.replace("__JS_FILENAME__", js_filename)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    written = [out_path, out_path.parent / js_filename]
     out_path.write_text(html)
-    js_path = out_path.parent / js_filename
-    js_path.write_text(js)
-    print(f"Wrote {out_path} and {js_path}")
+    written[1].write_text(js)
+
+    for filename, data in (
+        (lakes_filename, lakes_geojson(graph)),
+        (campsites_filename, campsites_geojson(graph)),
+        (portages_filename, portages_geojson(graph)),
+    ):
+        data_path = out_path.parent / filename
+        data_path.write_text(json.dumps(data))
+        written.append(data_path)
+
+    print("Wrote " + ", ".join(str(p) for p in written))
 
 
 if __name__ == "__main__":

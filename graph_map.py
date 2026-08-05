@@ -36,8 +36,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
-<script>
-    const lakes = __LAKES_GEOJSON__;
+<script src="__JS_FILENAME__"></script>
+</body>
+</html>
+"""
+
+JS_TEMPLATE = """    const lakes = __LAKES_GEOJSON__;
     const campsites = __CAMPSITES_GEOJSON__;
     const portages = __PORTAGES_GEOJSON__;
 
@@ -455,9 +459,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     map.on("click", (e) => handleRouteClick(e.latlng));
     portagesLayer.on("click", (e) => handleRouteClick(e.latlng));
     campsitesLayer.on("click", (e) => handleRouteClick(e.latlng));
-</script>
-</body>
-</html>
 """
 
 
@@ -529,17 +530,22 @@ def portages_geojson(graph):
 
 
 def render_map(graph, out_path="maps/bwca_graph_map.html"):
-    html = (
-        HTML_TEMPLATE
+    out_path = Path(out_path)
+    js_filename = out_path.stem + ".js"
+
+    js = (
+        JS_TEMPLATE
         .replace("__LAKES_GEOJSON__", json.dumps(lakes_geojson(graph)))
         .replace("__CAMPSITES_GEOJSON__", json.dumps(campsites_geojson(graph)))
         .replace("__PORTAGES_GEOJSON__", json.dumps(portages_geojson(graph)))
     )
+    html = HTML_TEMPLATE.replace("__JS_FILENAME__", js_filename)
 
-    out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html)
-    print(f"Wrote {out_path}")
+    js_path = out_path.parent / js_filename
+    js_path.write_text(js)
+    print(f"Wrote {out_path} and {js_path}")
 
 
 if __name__ == "__main__":

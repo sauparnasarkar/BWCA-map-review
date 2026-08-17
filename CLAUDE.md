@@ -225,6 +225,12 @@ commented-out code) rather than a pipeline — don't treat them as required step
   13 — 143 access points) still takes ~6-7 seconds, the same cost the original algorithm always
   paid there, just no longer hidden inside a multi-minute load. See the design doc's "What this fix
   does not address" note — an open follow-up, not something papered over.
+  Also at click time: `wireRiverSnapEdges()` in `graph_engine.js` lets a `"start"`/`"end"` node join
+  a routable river/connector polyline at its nearest point, not just at the polyline's own two
+  endpoints (which can be far from where it actually runs closest to a clicked lake) — see the design
+  doc's §2.11. Unlike the load-time fix above, this is purely additive to the graph (new nodes/edges
+  only), so it can't regress a previously-findable route; it adds ~450ms to a click on the worst-case
+  lake above, not another multi-second stall.
   All three write into `maps/` (directory not currently checked in — create it first, or the save
   will fail; `graph_map.py` creates it automatically).
 

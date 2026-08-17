@@ -35,7 +35,7 @@
     const MAX_LAKE_VERTICES = 24;
     const SIMPLIFY_TOLERANCE_DEG = 0.00015; // ~15m at BWCA's latitude
 
-    function createGraphEngine(turf, lakes) {
+    function createGraphEngine(turf, lakes, rivers) {
         const lakesById = new Map(lakes.features.map((f) => [f.properties.fw_id, f]));
         const nodes = new Map(); // nodeId -> { lakeId, coord: [lon, lat] }
         const adjacency = new Map(); // nodeId -> [{ to, weight, kind, geometry }]
@@ -58,7 +58,19 @@
             return simplifiedLakeCache.get(lakeId);
         }
 
-        const preparedLakeCache = new Map(); // lakeId -> { polygon, boundary } | null
+        // NOTE: the buffered `polygon` below is deliberately only used for the
+        // containment checks (is this endpoint close enough to count as "on"
+        // this lake), not for the obstruction check. Buffering the whole
+        // polygon-with-holes by 25m grows the water area on *every* boundary -
+        // exterior shoreline AND interior island rings alike - which erodes
+        // any land feature narrower than ~2x the buffer (peninsulas, necks
+        // between lobes, small islands) right out of the geometry. Confirmed
+        // against real data (Newfound Lake, fw_id 335): a chord that crosses
+        // the true shoreline 7 times crossed the buffered boundary 0 times,
+        // because the buffer had erased the narrow neck it was cutting
+        // across. `rawBoundary` (unbuffered, simplified) is kept separately
+        // for that check instead - see lineStaysInLake.
+        const preparedLakeCache = new Map(); // lakeId -> { polygon, rawBoundary } | null
         function preparedLake(lakeId) {
             if (!preparedLakeCache.has(lakeId)) {
                 const simplified = simplifiedLake(lakeId);
@@ -66,19 +78,35 @@
                     preparedLakeCache.set(lakeId, null);
                 } else {
                     const polygon = turf.buffer(simplified, LAKE_MATCH_BUFFER_METERS / 1000, { units: "kilometers" });
-                    preparedLakeCache.set(lakeId, { polygon, boundary: turf.polygonToLine(polygon) });
+                    preparedLakeCache.set(lakeId, { polygon, rawBoundary: turf.polygonToLine(simplified) });
                 }
             }
             return preparedLakeCache.get(lakeId);
         }
 
+        // A chord's endpoints are only guaranteed to be within
+        // LAKE_MATCH_BUFFER_METERS of the true shoreline (that's the whole
+        // reason `polygon` above is buffered for containment), so testing
+        // against the *true* boundary would spuriously flag a crossing right
+        // next to a near-shore endpoint that isn't actually on the polygon.
+        // Test against the true boundary, but disregard any crossing that
+        // falls within that same tolerance of either endpoint - that's
+        // expected endpoint noise, not a real obstruction. A crossing
+        // farther from both endpoints than the tolerance is real land in the
+        // middle of the chord and blocks it.
         function lineStaysInLake(coordA, coordB, lakeId) {
             const prepared = preparedLake(lakeId);
             if (!prepared) return false;
             if (!turf.booleanPointInPolygon(coordA, prepared.polygon)) return false;
             if (!turf.booleanPointInPolygon(coordB, prepared.polygon)) return false;
             const line = turf.lineString([coordA, coordB]);
-            return turf.lineIntersect(line, prepared.boundary).features.length === 0;
+            const crossings = turf.lineIntersect(line, prepared.rawBoundary).features;
+            return crossings.every((crossing) => {
+                const pt = crossing.geometry.coordinates;
+                const distA = turf.distance(pt, coordA, { units: "meters" });
+                const distB = turf.distance(pt, coordB, { units: "meters" });
+                return distA <= LAKE_MATCH_BUFFER_METERS || distB <= LAKE_MATCH_BUFFER_METERS;
+            });
         }
 
         // A straight chord between two shore points only works for convex lakes -
@@ -192,6 +220,107 @@
             adjacency.get(b).push({ to: a, weight, kind, geometry });
         }
 
+        // River-snap routing (click-time only): lets a click-time "start"/
+        // "end" node join a routable river/connector polyline at its nearest
+        // point, not just wherever the polyline's own two endpoints happen to
+        // land - a connector's real endpoint can be far from where it
+        // actually passes closest to a given lake (see docs/graph_map_design.md).
+        // Purely additive to the graph - new nodes/edges only, nothing
+        // existing is removed or recomputed differently, so it cannot make a
+        // previously-findable route unfindable.
+        const riverSnapNodes = new Set();
+        const riverSnapBySegment = new Map(); // riverIdx -> [{snapNodeId, location, coord}], sorted by location
+        const lakeBboxCache = new Map(); // lakeId -> [minX, minY, maxX, maxY] | null
+
+        const routableRivers = rivers ? rivers.features.filter((f) => f.properties.routable) : [];
+        const riverBBoxes = routableRivers.map((f) => turf.bbox(f));
+
+        function bboxesOverlap(a, b) {
+            return a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1];
+        }
+
+        function lakeBbox(lakeId) {
+            if (!lakeBboxCache.has(lakeId)) {
+                const prepared = preparedLake(lakeId);
+                lakeBboxCache.set(lakeId, prepared ? turf.bbox(prepared.polygon) : null);
+            }
+            return lakeBboxCache.get(lakeId);
+        }
+
+        function wireRiverSnapEdges(nodeId, lakeId, coord) {
+            if (!lakesById.get(lakeId) || routableRivers.length === 0) return;
+            const prepared = preparedLake(lakeId);
+            if (!prepared) return;
+            const bbox = lakeBbox(lakeId);
+            if (!bbox) return;
+
+            for (let riverIdx = 0; riverIdx < routableRivers.length; riverIdx++) {
+                if (!bboxesOverlap(bbox, riverBBoxes[riverIdx])) continue;
+                const feature = routableRivers[riverIdx];
+                if (!turf.booleanIntersects(feature, prepared.polygon)) continue;
+
+                const nearest = turf.nearestPointOnLine(feature, coord, { units: "meters" });
+                const snapCoord = nearest.geometry.coordinates;
+                if (!lineStaysInLake(coord, snapCoord, lakeId)) continue;
+
+                const snapNodeId = `river-snap:${riverIdx}:${nodeId}`;
+                nodes.set(snapNodeId, { lakeId, coord: snapCoord });
+                adjacency.set(snapNodeId, []);
+                riverSnapNodes.add(snapNodeId);
+
+                const reachDist = turf.distance(coord, snapCoord, { units: "meters" });
+                addEdge(nodeId, snapNodeId, reachDist, "paddle", turf.lineString([coord, snapCoord]).geometry);
+
+                // Seed the segment's own node_a/node_b as permanent anchor
+                // points (location 0 and full length) the first time any
+                // click touches this segment. Without this, a snap point only
+                // ever connects to OTHER click-time snap points on the exact
+                // same segment - it has no path into the rest of the
+                // already-built river network (the whole point of joining a
+                // connector partway along its length rather than only at its
+                // two endpoints).
+                if (!riverSnapBySegment.has(riverIdx)) {
+                    const anchors = [];
+                    const nodeAId = feature.properties.node_a;
+                    const nodeBId = feature.properties.node_b;
+                    const nodeAInfo = nodeAId != null ? nodes.get(nodeAId) : null;
+                    const nodeBInfo = nodeBId != null ? nodes.get(nodeBId) : null;
+                    if (nodeAInfo) anchors.push({ snapNodeId: nodeAId, location: 0, coord: nodeAInfo.coord });
+                    if (nodeBInfo) {
+                        const fullLength = turf.length(feature, { units: "meters" });
+                        anchors.push({ snapNodeId: nodeBId, location: fullLength, coord: nodeBInfo.coord });
+                    }
+                    riverSnapBySegment.set(riverIdx, anchors);
+                }
+                const points = riverSnapBySegment.get(riverIdx);
+                points.push({ snapNodeId, location: nearest.properties.location, coord: snapCoord });
+                points.sort((a, b) => a.location - b.location);
+
+                // Chain consecutive points along the segment (sorted by
+                // distance along the line - anchors and click-time snap
+                // points together) so a route can travel snap-to-snap or
+                // snap-to-anchor via the real connector geometry: either
+                // straight to another click's snap point on the same
+                // segment, or out through node_a/node_b into the rest of the
+                // precomputed river network.
+                for (let i = 0; i < points.length - 1; i++) {
+                    const a = points[i];
+                    const b = points[i + 1];
+                    const sliceLine = turf.lineSlice(a.coord, b.coord, feature);
+                    const sliceDist = turf.length(sliceLine, { units: "meters" });
+                    addEdge(a.snapNodeId, b.snapNodeId, sliceDist, "river", sliceLine.geometry);
+                }
+            }
+        }
+
+        function clearRiverSnapEdges() {
+            for (const snapNodeId of riverSnapNodes) {
+                removeNode(snapNodeId);
+            }
+            riverSnapNodes.clear();
+            riverSnapBySegment.clear();
+        }
+
         return {
             lakesById,
             nodes,
@@ -207,6 +336,8 @@
             addNode,
             removeNode,
             addEdge,
+            wireRiverSnapEdges,
+            clearRiverSnapEdges,
         };
     }
 

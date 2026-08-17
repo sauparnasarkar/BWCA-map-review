@@ -26,24 +26,24 @@
 │                                                        │  / __PORTAGES_URL__ / __RIVERS_URL│     │
 │                                                        │  / __PADDLE_EDGES_URL__           │     │
 │                                                        │  writes lakes/campsites/portages/ │     │
-│                                                        │  rivers .json, then calls          │     │
-│                                                        │  build_paddle_edges() (below)      │     │
+│                                                        │  rivers .json, then calls         │     │
+│                                                        │  build_paddle_edges() (below)     │     │
 │                                                        └────────────────┬──────────────────┘     │
 └──────────────────────────────────────────────────────────────────────┼───────────────────────────┘
                                                                           │ subprocess.run(["node", ...])
 ┌──────────────────────────── NODE BUILD PHASE (runs once, offline) ────┼───────────────────────────┐
 │                                                                        ▼                          │
-│  ┌────────────────────────────────────────────────────────────────────────────────────────────┐  │
-│  │  scripts/build_paddle_edges.js                                                              │  │
-│  │  - reads the lakes/portages/rivers .json files Python just wrote                           │  │
-│  │  - require("../templates/graph_engine.js") - the SAME code the browser runs for click-time  │  │
-│  │    wiring, unmodified, via @turf/turf@6 (package.json pins the same major version the       │  │
-│  │    browser loads from CDN)                                                                  │  │
-│  │  - replays the old portage/river ingestion loop (addNode/addEdge) - this is the expensive   │  │
-│  │    O(k^2)-per-lake chord-test work, now paid once here instead of once per page load         │  │
-│  │  - GraphEngine.dumpPrecomputed(engine) -> writes bwca_graph_map_paddle_edges.json           │  │
-│  └────────────────────────────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+│  ┌────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │  scripts/build_paddle_edges.js                                                             │   │
+│  │  - reads the lakes/portages/rivers .json files Python just wrote                           │   │
+│  │  - require("../templates/graph_engine.js") - the SAME code the browser runs for click-time │   │
+│  │    wiring, unmodified, via @turf/turf@6 (package.json pins the same major version the      │   │
+│  │    browser loads from CDN)                                                                 │   │
+│  │  - replays the old portage/river ingestion loop (addNode/addEdge) - this is the expensive  │   │
+│  │    O(k^2)-per-lake chord-test work, now paid once here instead of once per page load       │   │
+│  │  - GraphEngine.dumpPrecomputed(engine) -> writes bwca_graph_map_paddle_edges.json          │   │
+│  └────────────────────────────────────────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
                                                                           ▼
                                     maps/bwca_graph_map.html         (HTML shell, <script src=...>)
                                     maps/bwca_graph_map.js           (rendering + click-time routing)
@@ -72,6 +72,11 @@
 │  │                    │   │                       │   │    the fetched paddle_edges.json    │   │
 │  │                    │   │                       │   │    directly into nodes/adjacency,   │   │
 │  │                    │   │                       │   │    no chord tests at load time      │   │
+│  │                    │   │                       │   │  - wireRiverSnapEdges(): joins a    │   │
+│  │                    │   │                       │   │    connector mid-line at click      │   │
+│  │                    │   │                       │   │    time (see §2.11) - additive      │   │
+│  │                    │   │                       │   │    only, doesn't touch the          │   │
+│  │                    │   │                       │   │    precomputed graph above          │   │
 │  └─────────┬──────────┘   └───────────┬───────────┘   └───────────────────┬─────────────────┘   │
 │            │ click events             │ used by                           │ produces graph      │
 │            ▼                          │                                   ▼                     │
@@ -140,7 +145,7 @@ adjacency            : Map<nodeId, [{to, weight, kind, geometry}]>  # undirected
 accessPointsByLake   : Map<lakeId, [nodeId, ...]>          # which nodes currently sit on each lake
 
 simplifiedLakeCache  : Map<lakeId, simplifiedFeature | null>
-preparedLakeCache    : Map<lakeId, {polygon, boundary} | null>
+preparedLakeCache    : Map<lakeId, {polygon, rawBoundary} | null>
 vertexGraphBuilt     : Set<lakeId>                         # lakes whose boundary waypoints exist
 ```
 
@@ -167,16 +172,22 @@ function simplifiedLake(lakeId):
     return simplifiedLakeCache[lakeId]
 
 function preparedLake(lakeId):
-    # Buffers the simplified lake so off-polygon portage/river endpoints
-    # (within the 25m match tolerance) still count as "inside" the lake.
+    # `polygon` is buffered so off-polygon portage/river endpoints (within
+    # the 25m match tolerance) still count as "inside" the lake - used only
+    # for containment. `rawBoundary` is the TRUE (unbuffered, simplified)
+    # shoreline, kept separately for the obstruction test below - buffering
+    # the whole polygon-with-holes erodes any land feature narrower than
+    # ~2x the buffer (peninsulas, islands) right out of the geometry, which
+    # used to let a chord that actually crossed land test as valid (fixed;
+    # see the note after this pseudocode).
     if lakeId not in preparedLakeCache:
         simplified = simplifiedLake(lakeId)
         if simplified is null:
             preparedLakeCache[lakeId] = null
         else:
-            polygon  = turf.buffer(simplified, LAKE_MATCH_BUFFER_METERS/1000, units="kilometers")
-            boundary = turf.polygonToLine(polygon)
-            preparedLakeCache[lakeId] = {polygon, boundary}
+            polygon     = turf.buffer(simplified, LAKE_MATCH_BUFFER_METERS/1000, units="kilometers")
+            rawBoundary = turf.polygonToLine(simplified)
+            preparedLakeCache[lakeId] = {polygon, rawBoundary}
     return preparedLakeCache[lakeId]
 
 function lineStaysInLake(coordA, coordB, lakeId):
@@ -187,9 +198,36 @@ function lineStaysInLake(coordA, coordB, lakeId):
     if coordA not inside prepared.polygon: return false
     if coordB not inside prepared.polygon: return false
     line = turf.lineString([coordA, coordB])
-    return turf.lineIntersect(line, prepared.boundary).features.length == 0
-    # i.e. the chord touches the shoreline nowhere -> stays on open water
+    crossings = turf.lineIntersect(line, prepared.rawBoundary).features
+    # A crossing within LAKE_MATCH_BUFFER_METERS of either endpoint is
+    # expected near-shore noise (the endpoint itself may be up to that far
+    # off the true shoreline) rather than a real obstruction; only a
+    # crossing farther from BOTH endpoints than that blocks the chord.
+    return crossings.every(c ->
+        distance(c, coordA) <= LAKE_MATCH_BUFFER_METERS or
+        distance(c, coordB) <= LAKE_MATCH_BUFFER_METERS)
 ```
+
+**Buffer-erosion fix.** This used to test chords against the *buffered* boundary directly (`prepared.polygon`'s
+boundary line), which conflated two unrelated tolerances: how far a portage/river endpoint may sit from the
+true shoreline and still count as "on" the lake (a legitimate 25m allowance), versus what counts as an
+obstruction in the middle of a chord (should be the true shoreline, full stop). Buffering the whole
+polygon-with-holes by 25m grows the water area on every ring - exterior shoreline and interior islands alike
+- which erodes any land feature narrower than roughly 2x the buffer (a peninsula, a narrow neck between two
+lobes, a small island) out of the geometry the chord test checked against. Confirmed against real data
+(Newfound Lake, fw_id 335): a chord that crosses the true shoreline 7 times crossed the buffered boundary 0
+times, because the buffer had erased the narrow neck the chord was actually cutting across. Testing against
+`rawBoundary` (the true, unbuffered shoreline) fixes this without losing the endpoint tolerance, by ignoring
+only the crossings that fall within that tolerance of an endpoint rather than ignoring the land feature
+itself. Verified against the real dataset by diffing the precomputed paddle-edge graph before/after: node
+count unchanged (22,573 - this doesn't touch node creation), paddle edges dropped from 133,803 to 102,408;
+a random sample of 300 removed edges were each independently confirmed to cross the true shoreline outside
+both endpoints' tolerance zones (genuine land crossings, not over-blocking), and the reproduced Newfound
+chord specifically is now blocked. A smaller set of edges (13,903) that the old buffered check had wrongly
+blocked near shore are now correctly allowed. One accepted limitation of this approach: a chord shorter than
+2x the tolerance (50m) can never be blocked by construction, since any point on it is within 25m of at least
+one endpoint - a sub-50m chord that clips an extremely narrow sliver of land is treated as acceptable slop,
+consistent with the endpoint-tolerance semantics rather than a gap in them.
 
 **Paddle-edge precomputation (fixed):** adding rivers roughly doubled how many lakes ever build a
 vertex graph at all (~440 with portages alone → ~930 once routable river mouths are counted, since
@@ -294,7 +332,7 @@ fix, it isn't: a first click on Lac la Croix (fw_id 13 — 143 access points, th
 the dataset at 32,087 raw coordinates) measured **~6.8 seconds**, and a *second* click on the same
 lake (caches now warm, `vertexGraphBuilt` already true) still measured **~6.1 seconds** — meaning
 the one-time `simplify`/`buffer`/`polygonToLine` prep is not the dominant cost; the ~143 repeated
-`lineStaysInLake` calls (each a `lineIntersect` against that lake's buffered boundary line) are.
+`lineStaysInLake` calls (each a `lineIntersect` against that lake's shoreline) are.
 Basswood (fw_id 3731, the second-most-complex polygon) measured ~4.1 seconds similarly.
 
 This is **not a regression introduced by this fix** — the original, pre-precomputation algorithm
@@ -446,27 +484,32 @@ function nearestLake(coord):
 ### 2.8 Shortest path (~403–456)
 
 ```
+PADDLE_PREFERENCE_PENALTY = 1.3   # tunable: 1.0 = no preference, higher = stronger pull toward rivers/portages
+
 function dijkstra(startNode, endNode):
-    dist = {startNode: 0}
+    cost = {startNode: 0}       # search cost (paddle-penalized) - decides which path wins
+    trueDist = {startNode: 0}   # real distance (unweighted) - what gets reported/rendered
     prev = {}
     visited = {}
     queue = [(0, startNode)]                        # simple array-as-priority-queue
 
     while queue not empty:
-        queue.sort by distance ascending
-        (d, u) = queue.shift()
+        queue.sort by cost ascending
+        (c, u) = queue.shift()
         if u in visited: continue
         visited.add(u)
         if u == endNode: break
 
         for edge in adjacency.get(u, []):
-            alt = d + edge.weight
-            if alt < dist.get(edge.to, Infinity):
-                dist[edge.to] = alt
+            edgeCost = edge.weight * PADDLE_PREFERENCE_PENALTY if edge.kind == "paddle" else edge.weight
+            alt = c + edgeCost
+            if alt < cost.get(edge.to, Infinity):
+                cost[edge.to] = alt
+                trueDist[edge.to] = trueDist[u] + edge.weight
                 prev[edge.to] = u
                 queue.push((alt, edge.to))
 
-    if endNode not in dist: return null              # unreachable
+    if endNode not in cost: return null              # unreachable
 
     path = [endNode]
     current = endNode
@@ -474,8 +517,24 @@ function dijkstra(startNode, endNode):
         current = prev[current]
         path.push(current)
     path.reverse()
-    return {distance: dist[endNode], path}
+    return {distance: trueDist[endNode], path}        # true distance, NOT the penalized search cost
 ```
+
+**Why paddle edges are penalized (history).** `PADDLE_PREFERENCE_PENALTY` was originally added as a
+mitigation for a `lineStaysInLake` bug: the chord test used to run against the same 25m-*buffered*
+polygon used for portage/river endpoint tolerance, and that buffer eroded narrow peninsulas/islands
+out of the test geometry, letting some land-crossing chords test as "valid" (Newfound Lake, fw_id
+335, was the confirmed case - see §2.3's "Buffer-erosion fix"). The penalty made Dijkstra prefer a
+competitive portage/river alternative when one existed, without touching the graph itself - every
+edge that existed before still existed, so it could only change *which* path won, never whether a
+route was findable (all weights stay positive; the 9-pair regression set was verified to still
+resolve with the penalty active). It didn't help when a paddle chord was the *only* option, or when
+it was decisively shorter than any alternative. §2.3's fix now addresses the root cause directly -
+`lineStaysInLake` blocks genuine land crossings itself, rather than relying on Dijkstra to route
+around them when a cheaper alternative happens to exist. The penalty is kept in place regardless, on
+its own merits (a charted river/portage route is generally preferable to an open-water shortcut even
+when both are legal) rather than as a correctness workaround.
+
 Complexity note: this is O(E log E)-ish via array sort rather than a real binary heap. The static graph is now considerably larger than "portage nodes + at most two dynamic lake-vertex graphs" (rivers add thousands of pre-connected junction nodes, and ~930 lakes now carry a permanent boundary skeleton, up from ~440 with portages alone) — 22,573 nodes and 137,765 edges as of the current dataset. Each `dijkstra()` call still only traverses whatever the click-time `"start"`/`"end"` nodes connect to, so per-query cost tracks reachable graph size rather than total graph size, and building that larger graph is no longer paid at load time at all — it's precomputed once at build time (§2.3) and loaded as a flat JSON dump, which is fast to parse and insert regardless of graph size.
 
 ### 2.9 Route/UI state machine (~458–518)
@@ -488,6 +547,7 @@ function setStatus(text):
 
 function clearRoute():
     remove markerStart, markerEnd, routeLayer from map (if present)
+    clearRiverSnapEdges()                          # tear down §2.11's snap nodes/edges first
     removeNode("start"); removeNode("end")
     reset markerStart/markerEnd/routeLayer to null
     setStatus("Click a point on a lake to start a route.")
@@ -544,6 +604,7 @@ function handleRouteClick(latlng):
 
     role = "end" if "start" node already exists else "start"
     addNode(role, lakeFeature.properties.fw_id, snappedCoord)
+    wireRiverSnapEdges(role, lakeFeature.properties.fw_id, snappedCoord)   # see §2.11
     marker = L.marker([snappedCoord[1], snappedCoord[0]], title=role).addTo(map)
 
     if role == "start":
@@ -566,14 +627,115 @@ campsitesLayer.on("click", e -> handleRouteClick(e.latlng))
 riversLayer.on("click", e -> handleRouteClick(e.latlng))
 ```
 
----
+### 2.11 River-snap routing — joining a connector mid-line, not just at its endpoints (`graph_engine.js`)
+
+**Motivation.** A `"start"`/`"end"` click only ever routes onto the fixed graph via a straight paddle
+chord to an existing access point (portage endpoint, another river's junction node, or a lake
+boundary vertex) or via the vertex-graph obstacle-routing in §2.3/§2.4. It never had a way to join a
+`Connector (Lake)`/`Connector (River)`/`Centerline (River)` polyline anywhere *along its length* —
+only at the two endpoints that happen to be its own `node_a`/`node_b`, which can be far from where
+the connector actually runs closest to a clicked point (a lake's Connector (Lake) segment often has
+one endpoint on a completely different, distant lake). Without this, a route that should sensibly
+follow a marked channel instead zigzags through open-water paddle chords and boundary-vertex hops
+that happen to be shorter in isolation, even when a real connector runs right through the area.
+
+**Design.** Purely additive to the graph — new nodes and edges only, nothing existing is removed or
+recomputed differently — so unlike the two reverted §2.3 optimization attempts, this cannot make a
+previously-findable route unfindable; it can only add cheaper alternatives Dijkstra may now prefer.
+Runs only for click-time `"start"`/`"end"` nodes (not inside the generic `addNode`/`wirePaddleEdges`
+path), so the build-time precomputed graph (§2.3, §2.6) is completely untouched by this feature.
+
+```
+routableRivers = rivers.features.filter(f => f.properties.routable)   # computed once at engine creation
+riverBBoxes    = routableRivers.map(f => turf.bbox(f))                # cached once, not per click
+
+riverSnapNodes      : Set<snapNodeId>                                  # this route attempt's snap nodes
+riverSnapBySegment  : Map<riverIdx, [{snapNodeId, location, coord}]>   # per-segment, sorted by location
+lakeBboxCache        : Map<lakeId, bbox | null>                        # memoized, reuses preparedLake()
+
+function wireRiverSnapEdges(nodeId, lakeId, coord):
+    if lakeId not in lakesById or routableRivers is empty: return
+    prepared = preparedLake(lakeId)                    # same cached buffered polygon §2.3 already uses
+    if prepared is null: return
+    bbox = lakeBbox(lakeId)                             # turf.bbox(prepared.polygon), cached
+
+    for riverIdx, feature in routableRivers:
+        if not bboxesOverlap(bbox, riverBBoxes[riverIdx]): continue      # cheap numeric pre-filter
+        if not turf.booleanIntersects(feature, prepared.polygon): continue  # real geometry test, only for survivors
+
+        nearest = turf.nearestPointOnLine(feature, coord, units="meters")
+        snapCoord = nearest.geometry.coordinates
+        if not lineStaysInLake(coord, snapCoord, lakeId): continue        # same chord-safety gate as paddle edges
+
+        snapNodeId = f"river-snap:{riverIdx}:{nodeId}"
+        nodes[snapNodeId] = {lakeId, coord: snapCoord}
+        adjacency[snapNodeId] = []
+        riverSnapNodes.add(snapNodeId)
+        addEdge(nodeId, snapNodeId, distance(coord, snapCoord), kind="paddle",
+                geometry=straight line)                                    # the "reach" hop off open water
+
+        # Seed the segment's own node_a/node_b as permanent anchors the
+        # first time ANY click touches this segment - without this, a snap
+        # point only ever connects to OTHER click-time snap points on the
+        # exact same segment and has no path into the rest of the
+        # already-built river network. This was the actual bug in the first
+        # implementation attempt: it produced snap nodes with a reach edge
+        # back to the click but no connection onward, so "start" and "end"
+        # landing on two different (but network-connected) segments found
+        # no route through them at all.
+        if riverIdx not in riverSnapBySegment:
+            anchors = []
+            if nodes has feature.properties.node_a: anchors.push({snapNodeId: node_a, location: 0, coord: node_a's coord})
+            if nodes has feature.properties.node_b: anchors.push({snapNodeId: node_b, location: length(feature), coord: node_b's coord})
+            riverSnapBySegment[riverIdx] = anchors
+
+        points = riverSnapBySegment[riverIdx]
+        points.push({snapNodeId, location: nearest.properties.location, coord: snapCoord})
+        points.sort by location
+
+        # Chain every consecutive pair (anchors and click-time snap points
+        # together, in line order) so a route can travel snap-to-snap
+        # directly (both clicks land on the same segment) or snap-to-anchor
+        # out into the wider network (clicks land on different segments that
+        # are connected elsewhere via shared junction nodes).
+        for (a, b) in consecutive_pairs(points):
+            sliceLine = turf.lineSlice(a.coord, b.coord, feature)
+            addEdge(a.snapNodeId, b.snapNodeId, length(sliceLine), kind="river", geometry=sliceLine.geometry)
+
+function clearRiverSnapEdges():
+    for snapNodeId in riverSnapNodes:
+        removeNode(snapNodeId)     # reuses §2.5's removeNode - correctly unwinds reach + chain edges either
+                                    # direction; anchor nodes (node_a/node_b) are real permanent graph nodes
+                                    # and are never in riverSnapNodes, so they're never touched
+    riverSnapNodes.clear()
+    riverSnapBySegment.clear()
+```
+
+**Why the anchor-seeding step is load-bearing, not an optimization.** Every routable river feature's
+`node_a`/`node_b` already exist as real graph nodes from build-time ingestion (§2.6) — every routable
+segment gets both endpoints added via `addNode` regardless of whether either matched a lake. Wiring a
+fresh snap point to those two anchors is what lets Dijkstra reach the rest of the precomputed river
+network from a point the user clicked mid-line, not just to another snap point that happens to land
+on the identical segment. Verified via a Node harness reproducing the motivating case (Newfound Lake,
+fw_id 335): a first version without anchor-seeding created snap nodes that were structurally
+isolated dead ends whenever the two clicks landed on different segments, and found a pure-paddle
+route identical to before the feature existed; adding the anchors made the same test case resolve to
+a shorter route using the real connector geometry (3.31 km vs. the original 3.54 km paddle-only path
+— shorter, not just different, exactly as guaranteed by a purely additive graph change).
+
+**Cost.** Bounded per click, not per existing access point like §2.3/§2.5's `wirePaddleEdges` — it's
+one pass over routable river features (bbox-prefiltered before any real Turf call), not one pass per
+existing access point on the lake. Measured against the same pathological case that motivated §2.3's
+fix (Lac la Croix, fw_id 13, 143 access points): adds ~450ms to a click that already costs ~6-7s —
+real, but a small fraction of the existing cost, not a new stall of the same order.
 
 ### Key design properties worth flagging
 - **Lazy, cached geometry prep**: `simplifiedLake`/`preparedLake` memoize per-lake Turf operations; this was explicitly called out in the comments as fixing a page-freeze bug on large lakes, and again when rivers reintroduced a much bigger version of the same problem — now fixed by precomputing at build time rather than caching harder at load time (see §2.3/§2.4).
-- **Visibility graph is approximate, not exact**: paddle edges are chord tests against a buffered polygon (and, past a per-lake access-point cap, against a bounded boundary skeleton rather than every other point), not a true shortest-path-in-polygon solve — a blocked chord silently yields *no* edge rather than a routed-around one.
+- **Visibility graph is approximate, not exact**: paddle edges are chord tests against the true shoreline, tolerant of crossings within 25m of either endpoint (§2.3), and past a per-lake access-point cap, against a bounded boundary skeleton rather than every other point — not a true shortest-path-in-polygon solve. A blocked chord silently yields *no* edge rather than a routed-around one; a chord shorter than 50m can never be blocked, by construction (§2.3).
 - **Routing is undirected, including river edges**: a river segment can be traversed either direction at the same cost — upstream-vs-downstream travel time/current is not modeled. This is the same class of accepted approximation as the paddle-chord shortcut, not a bug to chase.
 - **Known correctness caveat carried from the data pipeline**: `fw_id = 88888` collisions (documented in CLAUDE.md) mean `lakesById` silently keeps only the last-loaded lake for that id, so routing near those lakes can attach to the wrong polygon. The same class of issue applies to rivers: ~71% of lake rows have a null `fw_id` and can never be a river's matched endpoint, and a stream that exits/re-enters the BWCA boundary clip becomes two disconnected pieces with dangling nodes at the clip line.
 - **Graph mutation is transient and query-scoped**: `"start"`/`"end"` nodes are added/removed per click cycle via the live `GraphEngine` instance's `addNode`/`removeNode`, while portage and routable-river nodes/edges are permanent and loaded once at init from the build-time precomputed dump (§2.3/§2.6), not recomputed.
 - **Data is now fetched, not embedded**: `render_map()` doesn't inline the GeoJSON blobs as JS literals — it writes them as sibling `.json` files (five now, including the precomputed paddle-edge graph) and the generated JS `fetch()`es them before `init()` runs. This makes the eight output files in `maps/` interdependent (the `.html` needs its two `.js` files, which need their five `.json` siblings) rather than one self-contained artifact — moving or renaming any of them without updating the others' filename placeholders breaks the page.
 - **Nullable numeric properties need explicit `None`, not raw `NaN`**: `rivers_geojson()` was the first serializer in this pipeline with a genuinely nullable numeric field (`fw_id_a`/`fw_id_b` — most river segments don't touch a lake at either end). Building the properties list with a raw pandas float lets `NaN` slip into the GeoDataFrame; going through `gdf.to_crs(4326).to_json()` (as all four `*_geojson()` functions do) converts that to a valid JSON `null` automatically — bypassing that and hand-rolling `json.dumps()` on the raw values would emit a literal `NaN` token, which isn't valid JSON and breaks `JSON.parse()` for the whole map, not just rivers.
 - **The rivers-driven load-time perf regression is fixed for load time specifically, via build-time precomputation, not a smarter approximation** — but a related click-time cost on the same pathological lakes is not, and is still open (see §2.3, "Paddle-edge precomputation" and the "What this fix does not address" note directly below it). The graph-construction logic that used to run per page load was extracted verbatim into `templates/graph_engine.js`, shared with a new Node build step (`scripts/build_paddle_edges.js`) that runs it once, offline. This is a different kind of fix than the two earlier attempts (a boundary-vertex ring; a coarser-tolerance boundary line), both of which changed the geometry approximation and were reverted after route-parity testing caught silent breakage — this fix changes *when* the exact same computation runs, not *what* it computes, verified via an edge-set diff (not just a route replay) plus a live browser click-path check. Browser load time dropped from a worst-case ~9.5 minutes to ~6 seconds. The first click on the highest-access-point/most-complex lake (Lac la Croix, fw_id 13) still takes ~6-7 seconds, though — that's the same O(access-points) click-time wiring cost the original algorithm always paid on this lake, just newly noticeable now that it's no longer hidden inside a multi-minute load. Any future change to the shared graph-construction logic in `graph_engine.js` should be held to the same edge-set-diff bar, since a visual spot-check won't catch a single blocked or dropped chord in a graph this size.
+- **River-snap routing (§2.11) is purely additive, unlike everything else that's ever touched this code path**: it only adds new nodes/edges at click time, never removes or recomputes an existing one, so it cannot regress a previously-findable route — the worst case is Dijkstra finding an equal-or-shorter alternative it didn't have before. That's a materially lower risk profile than the §2.3 optimization attempts or the build-time precomputation fix itself, both of which changed how *existing* edges got computed and needed edge-set-diff-level verification to trust. The one real bug found while building it (snap points with no path into the rest of the network, because the first version wired them only to each other and never to the segment's own `node_a`/`node_b`) was a missing-feature bug caught by an end-to-end test against the real motivating case, not a silent correctness regression in already-shipped behavior.

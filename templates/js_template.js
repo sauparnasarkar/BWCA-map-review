@@ -110,22 +110,21 @@
     // --- Route finding: portages (surveyed lines) + paddle edges across lakes ---
     // Paddle edges are a visibility-graph shortcut, not a full solve: for two
     // points on the same lake, if the straight line between them stays inside
-    // the lake polygon, it's added as a paddle edge weighted by straight-line
-    // distance. A chord blocked by an island (or crossing the gap between two
-    // disjoint pieces of a lake split by the boundary clip - see CLAUDE.md's
-    // CRS/clip gotcha) just gets no edge rather than routing around it - a
-    // safe undercount, not a wrong route, and good enough for a demo.
-    // NOTE: fw_id 88888 is a reused DNR placeholder shared by several
-    // unrelated lakes (see CLAUDE.md) - the graph only keeps the last one
-    // loaded, so routing near those lakes may be attached to the wrong polygon.
-    // --- Route finding: portages (surveyed lines) + paddle edges across lakes ---
-    // Paddle edges are a visibility-graph shortcut, not a full solve: for two
-    // points on the same lake, if the straight line between them stays inside
-    // the lake polygon, it's added as a paddle edge weighted by straight-line
-    // distance. A chord blocked by an island (or crossing the gap between two
-    // disjoint pieces of a lake split by the boundary clip - see CLAUDE.md's
-    // CRS/clip gotcha) just gets no edge rather than routing around it - a
-    // safe undercount, not a wrong route, and good enough for a demo.
+    // the (buffered) lake polygon, it's added as a paddle edge weighted by
+    // straight-line distance. A chord genuinely blocked by an island (or
+    // crossing the gap between two disjoint pieces of a lake split by the
+    // boundary clip - see CLAUDE.md's CRS/clip gotcha) just gets no edge
+    // rather than routing around it - a safe undercount, not a wrong route.
+    // lineStaysInLake used to have a second failure mode here: the same 25m
+    // buffer it used for near-shore portage/river endpoint tolerance also
+    // doubled as the chord-obstruction geometry, which erased any peninsula
+    // or island narrower than ~50m and let a chord that visually crossed a
+    // narrow neck of land pass as "valid" - confirmed against real data
+    // (Newfound Lake, fw_id 335): 7 true-shoreline crossings, 0 against the
+    // buffered polygon. Fixed by testing chords against the true (unbuffered)
+    // shoreline directly, ignoring only crossings that fall within 25m of
+    // either endpoint (expected near-shore noise, not real land) - see
+    // lineStaysInLake in graph_engine.js and docs/graph_map_design.md.
     // NOTE: fw_id 88888 is a reused DNR placeholder shared by several
     // unrelated lakes (see CLAUDE.md) - the graph only keeps the last one
     // loaded, so routing near those lakes may be attached to the wrong polygon.
@@ -143,8 +142,8 @@
     // (O(k) against one lake's existing access points, not O(k^2) across the
     // whole map) and still needs to run in the browser since a clicked point
     // isn't known until the user clicks it.
-    const engine = GraphEngine.createGraphEngine(turf, lakes);
-    const { nodes, adjacency, addNode, removeNode, addEdge } = engine;
+    const engine = GraphEngine.createGraphEngine(turf, lakes, rivers);
+    const { nodes, adjacency, addNode, removeNode, addEdge, wireRiverSnapEdges, clearRiverSnapEdges } = engine;
     GraphEngine.loadPrecomputed(engine, paddleEdges);
 
     function findLakeAtPoint(coord) {
@@ -170,30 +169,48 @@
         return { feature: best, coord: bestCoord, distance: bestDist };
     }
 
+    // Nudges Dijkstra toward portage/river edges over open-water paddle
+    // chords when they're competitively close, without changing what gets
+    // reported or which routes exist. Only "paddle" edges are penalized here
+    // (portage and river edges pass through at their real weight). Originally
+    // added as a mitigation for lineStaysInLake's buffer-erosion bug (a
+    // paddle chord could visually cross a narrow peninsula/island and still
+    // test as valid); that bug is now fixed at the source (see the chord-
+    // obstruction test in graph_engine.js), so this penalty is no longer
+    // covering for a correctness gap. Kept anyway on its own merits - a
+    // charted river/portage route is generally preferable to an open-water
+    // shortcut even when both are legal, and Dijkstra has no other way to
+    // express that preference. Still a soft nudge, not a filter: a paddle
+    // edge decisively shorter than any river/portage alternative still wins.
+    const PADDLE_PREFERENCE_PENALTY = 1.3; // tunable: 1.0 = no preference, higher = stronger pull toward rivers/portages
+
     function dijkstra(startNode, endNode) {
-        const dist = new Map([[startNode, 0]]);
+        const cost = new Map([[startNode, 0]]);      // search cost (paddle-penalized) - decides which path wins
+        const trueDist = new Map([[startNode, 0]]);  // real distance (unweighted) - what gets reported/rendered
         const prev = new Map();
         const visited = new Set();
         const queue = [[0, startNode]];
 
         while (queue.length) {
             queue.sort((a, b) => a[0] - b[0]);
-            const [d, u] = queue.shift();
+            const [c, u] = queue.shift();
             if (visited.has(u)) continue;
             visited.add(u);
             if (u === endNode) break;
 
             for (const edge of adjacency.get(u) || []) {
-                const alt = d + edge.weight;
-                if (alt < (dist.get(edge.to) ?? Infinity)) {
-                    dist.set(edge.to, alt);
+                const edgeCost = edge.kind === "paddle" ? edge.weight * PADDLE_PREFERENCE_PENALTY : edge.weight;
+                const alt = c + edgeCost;
+                if (alt < (cost.get(edge.to) ?? Infinity)) {
+                    cost.set(edge.to, alt);
+                    trueDist.set(edge.to, trueDist.get(u) + edge.weight);
                     prev.set(edge.to, u);
                     queue.push([alt, edge.to]);
                 }
             }
         }
 
-        if (!dist.has(endNode)) return null;
+        if (!cost.has(endNode)) return null;
 
         const path = [endNode];
         let current = endNode;
@@ -202,7 +219,7 @@
             path.push(current);
         }
         path.reverse();
-        return { distance: dist.get(endNode), path };
+        return { distance: trueDist.get(endNode), path };
     }
 
     let routeLayer = null;
@@ -217,6 +234,7 @@
         if (markerStart) map.removeLayer(markerStart);
         if (markerEnd) map.removeLayer(markerEnd);
         if (routeLayer) map.removeLayer(routeLayer);
+        clearRiverSnapEdges();
         removeNode("start");
         removeNode("end");
         markerStart = null;
@@ -306,6 +324,7 @@
 
         const role = nodes.has("start") ? "end" : "start";
         addNode(role, lakeFeature.properties.fw_id, snappedCoord);
+        wireRiverSnapEdges(role, lakeFeature.properties.fw_id, snappedCoord);
         const marker = L.marker([snappedCoord[1], snappedCoord[0]], {
             title: role === "start" ? "Start" : "End"
         }).addTo(map);

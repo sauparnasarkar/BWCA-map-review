@@ -1,0 +1,11 @@
+{
+  "name": "bwca-map-build",
+  "private": true,
+  "description": "Build-time Node tooling for graph_map.py - precomputes the routing graph's paddle-edge mesh (see scripts/build_paddle_edges.js) using the same Turf.js version the browser loads from CDN, so results match by construction.",
+  "scripts": {
+    "build-paddle-edges": "node scripts/build_paddle_edges.js"
+  },
+  "dependencies": {
+    "@turf/turf": "^6.5.0"
+  }
+}

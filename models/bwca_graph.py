@@ -3,6 +3,7 @@ import geopandas as gpd
 from models.Campsite import Campsite
 from models.Lake import Lake
 from models.Portage import Portage
+from models.River import River
 
 class bwca_graph:
 
@@ -13,6 +14,8 @@ class bwca_graph:
         self.campsites = {}
 
         self.portages = []
+
+        self.rivers = []
 
 
 
@@ -104,6 +107,37 @@ class bwca_graph:
 
             portage.Lake_a.connections.append(portage)
             portage.Lake_b.connections.append(portage)
+
+    def load_rivers(self, filename):
+        river_df = gpd.read_parquet(filename)
+
+        for _, row in river_df.iterrows():
+
+            river = River(
+                node_a=row["node_a"],
+                node_b=row["node_b"],
+                length_m=row["length_m"],
+                geometry=row.geometry,
+                strm_type=row["strm_type"],
+                routable=row["routable"],
+                name=row["name"],
+                Lake_a=self.lakes.get(row["fw_id_a"]),
+                Lake_b=self.lakes.get(row["fw_id_b"]),
+                dist_lake_a=row["dist_lake_a"],
+                dist_lake_b=row["dist_lake_b"]
+            )
+
+            self.rivers.append(river)
+
+    def connect_rivers(self):
+
+        for river in self.rivers:
+
+            if river.Lake_a is not None:
+                river.Lake_a.connections.append(river)
+
+            if river.Lake_b is not None:
+                river.Lake_b.connections.append(river)
 
     def find_lake(self, fw_id):
 

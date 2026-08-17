@@ -1,8 +1,10 @@
     const LAKES_URL = "__LAKES_URL__";
     const CAMPSITES_URL = "__CAMPSITES_URL__";
     const PORTAGES_URL = "__PORTAGES_URL__";
+    const RIVERS_URL = "__RIVERS_URL__";
+    const PADDLE_EDGES_URL = "__PADDLE_EDGES_URL__";
 
-    function init(lakes, campsites, portages) {
+    function init(lakes, campsites, portages, rivers, paddleEdges) {
     const map = L.map("map");
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         attribution: "&copy; OpenStreetMap contributors"
@@ -53,11 +55,32 @@
         div.innerHTML = `
             <b>Portage match confidence</b><br>
             <span style="display:inline-block;width:20px;border-top:3px solid #0f5c2e;margin-right:4px;"></span>Confident<br>
-            <span style="display:inline-block;width:20px;border-top:3px dashed #dc2626;margin-right:4px;"></span>Uncertain (&gt;25m from lake)
+            <span style="display:inline-block;width:20px;border-top:3px dashed #dc2626;margin-right:4px;"></span>Uncertain (&gt;25m from lake)<br>
+            <b>Rivers &amp; streams</b><br>
+            <span style="display:inline-block;width:20px;border-top:2px solid #0891b2;margin-right:4px;"></span>Routable (river/connector)<br>
+            <span style="display:inline-block;width:20px;border-top:2px dotted #0891b2;margin-right:4px;"></span>Display only (small stream)
         `;
         return div;
     };
     legend.addTo(map);
+
+    // Display-only layer: all four "real flow" segment types render here so
+    // the map reflects the actual stream network, but only routable ones
+    // (see rivers.features properties.routable, set by riverCreator.py) get
+    // wired into the routing graph below - see CLAUDE.md/plan notes on why
+    // small perennial creeks are shown but not treated as paddleable edges.
+    const riversLayer = L.geoJSON(rivers, {
+        style: (feature) => ({
+            color: "#0891b2",
+            weight: feature.properties.routable ? 2 : 1.5,
+            opacity: feature.properties.routable ? 0.85 : 0.6,
+            dashArray: feature.properties.routable ? null : "1 4"
+        }),
+        onEachFeature: function (feature, layer) {
+            const p = feature.properties;
+            layer.bindTooltip(`${p.name || "Unnamed stream"} &mdash; ${p.strm_type}`);
+        }
+    }).addTo(map);
 
     const campsitesLayer = L.markerClusterGroup();
     L.geoJSON(campsites, {
@@ -95,158 +118,34 @@
     // NOTE: fw_id 88888 is a reused DNR placeholder shared by several
     // unrelated lakes (see CLAUDE.md) - the graph only keeps the last one
     // loaded, so routing near those lakes may be attached to the wrong polygon.
-    const ROD_TO_METERS = 5.0292;
-
-    const lakesById = new Map(lakes.features.map((f) => [f.properties.fw_id, f]));
-    const nodes = new Map(); // nodeId -> { lakeId, coord: [lon, lat] }
-    const adjacency = new Map(); // nodeId -> [{ to, weight, kind, geometry }]
-    const accessPointsByLake = new Map(); // lakeId -> [nodeId, ...]
-
-    function addEdge(a, b, weight, kind, geometry) {
-        adjacency.get(a).push({ to: b, weight, kind, geometry });
-        adjacency.get(b).push({ to: a, weight, kind, geometry });
-    }
-
-    // Portage endpoints are only guaranteed to be within ~25m of their matched
-    // lake (portageCreator.py's own "confident match" threshold), not strictly
-    // inside its polygon - buffer by that same tolerance before doing
-    // containment/line-of-sight checks, or every off-polygon endpoint would be
-    // stranded with zero paddle edges. Simplify first so the buffer (which
-    // adds rounding vertices at every corner) stays cheap on large/complex
-    // lake polygons, and cache both the buffered polygon AND its boundary-as-
-    // a-line - line-of-sight gets called many times per lake once vertex
-    // waypoints are involved, and re-deriving the boundary from scratch each
-    // call (instead of caching it) is what made the first version of this
-    // freeze the page on anything but the smallest lakes.
-    const LAKE_MATCH_BUFFER_METERS = 25;
-    const MAX_LAKE_VERTICES = 24;
-    const SIMPLIFY_TOLERANCE_DEG = 0.00015; // ~15m at BWCA's latitude
-
-    const simplifiedLakeCache = new Map();
-    function simplifiedLake(lakeId) {
-        if (!simplifiedLakeCache.has(lakeId)) {
-            const feature = lakesById.get(lakeId);
-            let simplified = null;
-            if (feature) {
-                try {
-                    simplified = turf.simplify(feature, { tolerance: SIMPLIFY_TOLERANCE_DEG, highQuality: false });
-                } catch {
-                    simplified = feature;
-                }
-            }
-            simplifiedLakeCache.set(lakeId, simplified);
-        }
-        return simplifiedLakeCache.get(lakeId);
-    }
-
-    const preparedLakeCache = new Map(); // lakeId -> { polygon, boundary } | null
-    function preparedLake(lakeId) {
-        if (!preparedLakeCache.has(lakeId)) {
-            const simplified = simplifiedLake(lakeId);
-            if (!simplified) {
-                preparedLakeCache.set(lakeId, null);
-            } else {
-                const polygon = turf.buffer(simplified, LAKE_MATCH_BUFFER_METERS / 1000, { units: "kilometers" });
-                preparedLakeCache.set(lakeId, { polygon, boundary: turf.polygonToLine(polygon) });
-            }
-        }
-        return preparedLakeCache.get(lakeId);
-    }
-
-    function lineStaysInLake(coordA, coordB, lakeId) {
-        const prepared = preparedLake(lakeId);
-        if (!prepared) return false;
-        if (!turf.booleanPointInPolygon(coordA, prepared.polygon)) return false;
-        if (!turf.booleanPointInPolygon(coordB, prepared.polygon)) return false;
-        const line = turf.lineString([coordA, coordB]);
-        return turf.lineIntersect(line, prepared.boundary).features.length === 0;
-    }
-
-    // A straight chord between two shore points only works for convex lakes -
-    // any point/peninsula between them blocks it even with open water all
-    // around. This is a real visibility graph, not just the chord shortcut:
-    // once a lake has 2+ access points, add its own (simplified) boundary
-    // vertices as extra waypoint nodes, wired in the same line-of-sight way,
-    // so Dijkstra can hop shore-to-shore around a peninsula instead of
-    // requiring one unobstructed line. Built lazily per lake (only lakes that
-    // end up with 2+ access points need it) and cached.
-    const vertexGraphBuilt = new Set();
-
-    function lakeBoundaryPoints(lakeId) {
-        const simplified = simplifiedLake(lakeId);
-        if (!simplified) return [];
-        const rings = simplified.geometry.type === "Polygon"
-            ? simplified.geometry.coordinates
-            : simplified.geometry.coordinates.flat();
-
-        let points = rings.flatMap((ring) => ring.slice(0, -1));
-        if (points.length > MAX_LAKE_VERTICES) {
-            const step = Math.ceil(points.length / MAX_LAKE_VERTICES);
-            points = points.filter((_, i) => i % step === 0);
-        }
-        return points;
-    }
-
-    function buildLakeVertexGraph(lakeId) {
-        if (vertexGraphBuilt.has(lakeId)) return;
-        vertexGraphBuilt.add(lakeId);
-        lakeBoundaryPoints(lakeId).forEach((coord, i) => {
-            addNode(`vertex:${lakeId}:${i}`, lakeId, coord);
-        });
-    }
-
-    function wirePaddleEdges(nodeId, lakeId, coord) {
-        if (!lakesById.get(lakeId)) return;
-        const accessPoints = accessPointsByLake.get(lakeId) || [];
-        if (accessPoints.length >= 1 && !vertexGraphBuilt.has(lakeId)) {
-            buildLakeVertexGraph(lakeId);
-        }
-        for (const otherId of accessPoints) {
-            const otherCoord = nodes.get(otherId).coord;
-            if (lineStaysInLake(coord, otherCoord, lakeId)) {
-                const distance = turf.distance(coord, otherCoord, { units: "meters" });
-                addEdge(nodeId, otherId, distance, "paddle", turf.lineString([coord, otherCoord]).geometry);
-            }
-        }
-    }
-
-    function addNode(nodeId, lakeId, coord) {
-        if (nodes.has(nodeId)) return;
-        nodes.set(nodeId, { lakeId, coord });
-        adjacency.set(nodeId, []);
-        wirePaddleEdges(nodeId, lakeId, coord);
-        if (!accessPointsByLake.has(lakeId)) accessPointsByLake.set(lakeId, []);
-        accessPointsByLake.get(lakeId).push(nodeId);
-    }
-
-    function removeNode(nodeId) {
-        if (!nodes.has(nodeId)) return;
-        const node = nodes.get(nodeId);
-        for (const edge of adjacency.get(nodeId)) {
-            const neighborEdges = adjacency.get(edge.to);
-            const idx = neighborEdges.findIndex((e) => e.to === nodeId);
-            if (idx !== -1) neighborEdges.splice(idx, 1);
-        }
-        adjacency.delete(nodeId);
-        nodes.delete(nodeId);
-        const lakePoints = accessPointsByLake.get(node.lakeId);
-        if (lakePoints) {
-            const idx = lakePoints.indexOf(nodeId);
-            if (idx !== -1) lakePoints.splice(idx, 1);
-        }
-    }
-
-    // One portage = one edge between its two lake-side endpoints, using its
-    // real surveyed geometry (not a straight line) for rendering.
-    for (const feature of portages.features) {
-        const p = feature.properties;
-        const coords = feature.geometry.coordinates;
-        const nodeA = `portage:${p.portage_number}:a`;
-        const nodeB = `portage:${p.portage_number}:b`;
-        addNode(nodeA, p.fw_id_a, coords[0]);
-        addNode(nodeB, p.fw_id_b, coords[coords.length - 1]);
-        addEdge(nodeA, nodeB, p.length_rods * ROD_TO_METERS, "portage", feature.geometry);
-    }
+    // --- Route finding: portages (surveyed lines) + paddle edges across lakes ---
+    // Paddle edges are a visibility-graph shortcut, not a full solve: for two
+    // points on the same lake, if the straight line between them stays inside
+    // the lake polygon, it's added as a paddle edge weighted by straight-line
+    // distance. A chord blocked by an island (or crossing the gap between two
+    // disjoint pieces of a lake split by the boundary clip - see CLAUDE.md's
+    // CRS/clip gotcha) just gets no edge rather than routing around it - a
+    // safe undercount, not a wrong route, and good enough for a demo.
+    // NOTE: fw_id 88888 is a reused DNR placeholder shared by several
+    // unrelated lakes (see CLAUDE.md) - the graph only keeps the last one
+    // loaded, so routing near those lakes may be attached to the wrong polygon.
+    //
+    // The full graph-construction logic (addNode/wirePaddleEdges/
+    // buildLakeVertexGraph/lineStaysInLake) lives in graph_engine.js, shared
+    // with scripts/build_paddle_edges.js, which runs this exact code once at
+    // build time over every portage endpoint, routable river endpoint, and
+    // lake boundary vertex - see that file and docs/graph_map_design.md's
+    // "Paddle-edge precomputation" section for why. Loading that precomputed
+    // result (below) replaces what used to be a live portage/river ingestion
+    // loop here, calling the same expensive chord tests on every page load
+    // for ~930 lakes. Click-time start/end wiring still calls this engine's
+    // addNode/wirePaddleEdges live - that path was never the expensive part
+    // (O(k) against one lake's existing access points, not O(k^2) across the
+    // whole map) and still needs to run in the browser since a clicked point
+    // isn't known until the user clicks it.
+    const engine = GraphEngine.createGraphEngine(turf, lakes);
+    const { nodes, adjacency, addNode, removeNode, addEdge } = engine;
+    GraphEngine.loadPrecomputed(engine, paddleEdges);
 
     function findLakeAtPoint(coord) {
         for (const feature of lakes.features) {
@@ -331,7 +230,7 @@
         if (routeLayer) map.removeLayer(routeLayer);
 
         if (!result) {
-            setStatus("No route found - these lakes aren't connected by any recorded portage.");
+            setStatus("No route found - these lakes aren't connected by any recorded portage or river.");
             return;
         }
 
@@ -340,11 +239,13 @@
             segments.push(adjacency.get(result.path[i]).find((e) => e.to === result.path[i + 1]));
         }
 
+        const ROUTE_COLORS = { portage: "#7c2d12", paddle: "#1d4ed8", river: "#0891b2" };
+
         routeLayer = L.geoJSON(
             segments.map((s) => ({ type: "Feature", properties: { kind: s.kind }, geometry: s.geometry })),
             {
                 style: (feature) => ({
-                    color: feature.properties.kind === "portage" ? "#7c2d12" : "#1d4ed8",
+                    color: ROUTE_COLORS[feature.properties.kind],
                     weight: 5,
                     opacity: 0.9,
                     dashArray: feature.properties.kind === "portage" ? "2 6" : null
@@ -354,14 +255,18 @@
 
         const rods = segments
             .filter((s) => s.kind === "portage")
-            .reduce((sum, s) => sum + s.weight / ROD_TO_METERS, 0);
+            .reduce((sum, s) => sum + s.weight / GraphEngine.ROD_TO_METERS, 0);
         const paddleKm = segments
             .filter((s) => s.kind === "paddle")
+            .reduce((sum, s) => sum + s.weight, 0) / 1000;
+        const riverKm = segments
+            .filter((s) => s.kind === "river")
             .reduce((sum, s) => sum + s.weight, 0) / 1000;
 
         setStatus(
             `Route found: ${(result.distance / 1000).toFixed(2)} km total ` +
-            `(${rods.toFixed(0)} rods of portaging, ${paddleKm.toFixed(2)} km paddling).`
+            `(${rods.toFixed(0)} rods of portaging, ${paddleKm.toFixed(2)} km paddling, ` +
+            `${riverKm.toFixed(2)} km river).`
         );
     }
 
@@ -417,14 +322,17 @@
     map.on("click", (e) => handleRouteClick(e.latlng));
     portagesLayer.on("click", (e) => handleRouteClick(e.latlng));
     campsitesLayer.on("click", (e) => handleRouteClick(e.latlng));
+    riversLayer.on("click", (e) => handleRouteClick(e.latlng));
     }
 
     Promise.all([
         fetch(LAKES_URL).then((r) => r.json()),
         fetch(CAMPSITES_URL).then((r) => r.json()),
         fetch(PORTAGES_URL).then((r) => r.json()),
+        fetch(RIVERS_URL).then((r) => r.json()),
+        fetch(PADDLE_EDGES_URL).then((r) => r.json()),
     ])
-        .then(([lakes, campsites, portages]) => init(lakes, campsites, portages))
+        .then(([lakes, campsites, portages, rivers, paddleEdges]) => init(lakes, campsites, portages, rivers, paddleEdges))
         .catch((err) => {
             console.error("Failed to load map data:", err);
             document.getElementById("map").textContent = "Failed to load map data - see console for details.";

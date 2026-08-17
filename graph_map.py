@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import geopandas as gpd
@@ -11,9 +13,11 @@ from models.bwca_graph import bwca_graph
 # fileCreator.py/portageCreator.py actually wrote.
 SOURCE_CRS = "EPSG:26915"
 
-TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+REPO_ROOT = Path(__file__).resolve().parent
+TEMPLATES_DIR = REPO_ROOT / "templates"
 HTML_TEMPLATE = (TEMPLATES_DIR / "html_template.html").read_text()
 JS_TEMPLATE = (TEMPLATES_DIR / "js_template.js").read_text()
+ENGINE_TEMPLATE = (TEMPLATES_DIR / "graph_engine.js").read_text()
 
 
 def build_graph():
@@ -25,6 +29,9 @@ def build_graph():
 
     graph.load_portages("Data/processed/bwca_portages.parquet")
     graph.connect_portages()
+
+    graph.load_rivers("Data/processed/bwca_rivers.parquet")
+    graph.connect_rivers()
 
     return graph
 
@@ -83,35 +90,90 @@ def portages_geojson(graph):
     return json.loads(gdf.to_crs(4326).to_json())
 
 
+def rivers_geojson(graph):
+    rivers = graph.rivers
+    gdf = gpd.GeoDataFrame(
+        {
+            "name": [r.name if isinstance(r.name, str) else None for r in rivers],
+            "strm_type": [r.strm_type for r in rivers],
+            "routable": [bool(r.routable) for r in rivers],
+            "node_a": [r.node_a for r in rivers],
+            "node_b": [r.node_b for r in rivers],
+            "fw_id_a": [r.Lake_a.fw_id if r.Lake_a else None for r in rivers],
+            "fw_id_b": [r.Lake_b.fw_id if r.Lake_b else None for r in rivers],
+            "length_m": [r.length_m for r in rivers],
+        },
+        geometry=[r.geometry for r in rivers],
+        crs=SOURCE_CRS,
+    )
+    return json.loads(gdf.to_crs(4326).to_json())
+
+
+def build_paddle_edges(stem_path):
+    """Runs scripts/build_paddle_edges.js to precompute the fixed portage/
+    river/lake-vertex paddle-edge mesh, replaying graph_engine.js's exact
+    client-side wiring logic once at build time instead of once per page
+    load - see docs/graph_map_design.md's "Paddle-edge precomputation"
+    section. Requires `npm install` to have been run (package.json pins
+    @turf/turf to the same major version the browser loads from CDN)."""
+    result = subprocess.run(
+        ["node", "scripts/build_paddle_edges.js", str(stem_path)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        raise RuntimeError(
+            "scripts/build_paddle_edges.js failed - run `npm install` from the "
+            "repo root if @turf/turf isn't installed yet."
+        )
+    print(result.stdout.strip())
+
+
 def render_map(graph, out_path="maps/bwca_graph_map.html"):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     js_filename = out_path.stem + ".js"
+    engine_filename = out_path.stem + "_engine.js"
     lakes_filename = out_path.stem + "_lakes.json"
     campsites_filename = out_path.stem + "_campsites.json"
     portages_filename = out_path.stem + "_portages.json"
+    rivers_filename = out_path.stem + "_rivers.json"
+    paddle_edges_filename = out_path.stem + "_paddle_edges.json"
 
-    html = HTML_TEMPLATE.replace("__JS_FILENAME__", js_filename)
+    html = (
+        HTML_TEMPLATE
+        .replace("__JS_FILENAME__", js_filename)
+        .replace("__ENGINE_FILENAME__", engine_filename)
+    )
     js = (
         JS_TEMPLATE
         .replace("__LAKES_URL__", lakes_filename)
         .replace("__CAMPSITES_URL__", campsites_filename)
         .replace("__PORTAGES_URL__", portages_filename)
+        .replace("__RIVERS_URL__", rivers_filename)
+        .replace("__PADDLE_EDGES_URL__", paddle_edges_filename)
     )
 
-    written = [out_path, out_path.parent / js_filename]
+    written = [out_path, out_path.parent / js_filename, out_path.parent / engine_filename]
     out_path.write_text(html)
     written[1].write_text(js)
+    written[2].write_text(ENGINE_TEMPLATE)
 
     for filename, data in (
         (lakes_filename, lakes_geojson(graph)),
         (campsites_filename, campsites_geojson(graph)),
         (portages_filename, portages_geojson(graph)),
+        (rivers_filename, rivers_geojson(graph)),
     ):
         data_path = out_path.parent / filename
         data_path.write_text(json.dumps(data))
         written.append(data_path)
+
+    build_paddle_edges(out_path.parent / out_path.stem)
+    written.append(out_path.parent / paddle_edges_filename)
 
     print("Wrote " + ", ".join(str(p) for p in written))
 
